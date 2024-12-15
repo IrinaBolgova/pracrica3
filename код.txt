@@ -1,0 +1,227 @@
+Для файла config.txt:
+
+127.0.0.1
+5000
+
+Для файла Program.cs:
+
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+class ChatApp
+{
+    private static readonly string ConfigFile = "config.txt";
+    private static readonly string LogFile = "log.txt";
+    private static CancellationTokenSource cts = new CancellationTokenSource();
+
+    static void Main(string[] args)
+    {
+        // Load configuration
+        var (address, port) = LoadConfiguration();
+
+        Console.WriteLine("Starting application. Press Ctrl+C to exit.");
+
+        // Start TCP and UDP tasks
+        Task.Run(() => StartTcpServer(address, port, cts.Token));
+        Task.Run(() => StartUdpServer(address, port, cts.Token));
+        Task.Run(() => StartClient(address, port, cts.Token));
+
+        // Handle graceful shutdown
+        Console.CancelKeyPress += (sender, e) =>
+        {
+            e.Cancel = true;
+            cts.Cancel();
+        };
+
+        // Wait until cancellation
+        cts.Token.WaitHandle.WaitOne();
+        Console.WriteLine("Application terminated.");
+    }
+
+    static (string, int) LoadConfiguration()
+    {
+        try
+        {
+            if (File.Exists(ConfigFile))
+            {
+                var config = File.ReadAllLines(ConfigFile);
+                string address = config[0];
+                int port = int.Parse(config[1]);
+                return (address, port);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogError("Error loading configuration: " + ex.Message);
+        }
+
+        // Default configuration
+        return ("127.0.0.1", 5000);
+    }
+
+    static async Task StartTcpServer(string address, int port, CancellationToken token)
+    {
+        TcpListener listener = new TcpListener(IPAddress.Parse(address), port);
+        listener.Start();
+        Console.WriteLine($"TCP Server started on {address}:{port}");
+
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                if (listener.Pending())
+                {
+                    var client = await listener.AcceptTcpClientAsync();
+                    _ = Task.Run(() => HandleTcpClient(client, token));
+                }
+                await Task.Delay(100, token);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogError("TCP Server error: " + ex.Message);
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    private static readonly List<TcpClient> connectedClients = new List<TcpClient>();
+
+    static async Task HandleTcpClient(TcpClient client, CancellationToken token)
+    {
+        lock (connectedClients)
+            connectedClients.Add(client);
+
+        try
+        {
+            using var stream = client.GetStream();
+            byte[] buffer = new byte[1024];
+            while (!token.IsCancellationRequested && client.Connected)
+            {
+                int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, token);
+                if (bytesRead > 0)
+                {
+                    string message = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                    Console.WriteLine($"[TCP] {DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}");
+
+                    // Разослать сообщение всем клиентам2
+                    BroadcastMessage(message, token);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogError("TCP Client error: " + ex.Message);
+        }
+        finally
+        {
+            lock (connectedClients)
+                connectedClients.Remove(client);
+        }
+    }
+
+    static void BroadcastMessage(string message, CancellationToken token)
+    {
+        byte[] data = Encoding.UTF8.GetBytes(message);
+        lock (connectedClients)
+        {
+            foreach (var client in connectedClients)
+            {
+                if (client.Connected)
+                {
+                    try
+                    {
+                        var stream = client.GetStream();
+                        stream.WriteAsync(data, 0, data.Length, token);
+                    }
+                    catch
+                    {
+                        // Игнорируем ошибки отправки клиенту
+                    }
+                }
+            }
+        }
+    }
+
+
+    static async Task StartUdpServer(string address, int port, CancellationToken token)
+    {
+        UdpClient udpClient = new UdpClient(port);
+        Console.WriteLine($"UDP Server started on {address}:{port}");
+
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                var result = await udpClient.ReceiveAsync(token);
+                string message = Encoding.UTF8.GetString(result.Buffer);
+                Console.WriteLine($"[UDP] {DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}");
+            }
+        }
+        catch (Exception ex)
+        {
+            LogError("UDP Server error: " + ex.Message);
+        }
+        finally
+        {
+            udpClient.Dispose();
+        }
+    }
+
+    static async Task StartClient(string address, int port, CancellationToken token)
+    {
+        Console.WriteLine("Client ready. Type messages to send.");
+        TcpClient tcpClient = new TcpClient();
+        await tcpClient.ConnectAsync(address, port);
+
+        try
+        {
+            using var stream = tcpClient.GetStream();
+            var readTask = Task.Run(async () =>
+            {
+                byte[] buffer = new byte[1024];
+                while (!token.IsCancellationRequested)
+                {
+                    int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, token);
+                    if (bytesRead > 0)
+                    {
+                        string response = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                        Console.WriteLine($"[SERVER] {DateTime.Now:yyyy-MM-dd HH:mm:ss} - {response}");
+                    }
+                }
+            }, token);
+
+            while (!token.IsCancellationRequested)
+            {
+                string? message = Console.ReadLine();
+                if (!string.IsNullOrEmpty(message))
+                {
+                    byte[] data = Encoding.UTF8.GetBytes(message);
+                    await stream.WriteAsync(data, 0, data.Length, token);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogError("Client error: " + ex.Message);
+        }
+        finally
+        {
+            tcpClient.Close();
+        }
+    }
+
+
+    static void LogError(string message)
+    {
+        Console.WriteLine($"[ERROR] {DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}");
+        File.AppendAllText(LogFile, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}\n");
+    }
+}
